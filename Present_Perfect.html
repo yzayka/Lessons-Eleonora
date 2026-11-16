@@ -349,7 +349,69 @@ function scheduleCloud(){
   if(cloudReady()){ cloudStatus('Changes waiting to sync…'); cloudTimer=setTimeout(syncCloud,3500); }
 }
 const localSave=save;
-save=function(){ localSave(); scheduleCloud(); };
+const isTeacherView=()=>new URLSearchParams(location.search).get('view')==='teacher';
+let localEditsSinceLoad=false;
+save=function(){
+ localEditsSinceLoad=true;
+ localSave();
+ if(!isTeacherView())scheduleCloud();
+};
+function cloudRead(cfg){
+ return new Promise((resolve,reject)=>{
+  const cb='ppack_'+Math.random().toString(36).slice(2);
+  const tag=document.createElement('script');let timeout;
+  const cleanup=()=>{clearTimeout(timeout);tag.remove();delete window[cb];};
+  window[cb]=result=>{cleanup();resolve(result);};
+  tag.onerror=()=>{cleanup();reject(Error('Не вдалося отримати відповіді з Google Sheets.'));};
+  timeout=setTimeout(()=>{cleanup();reject(Error('Час очікування Google Sheets вичерпано.'));},15000);
+  const url=new URL(cfg.url);
+  url.searchParams.set('action','read');
+  url.searchParams.set('key',cfg.key);
+  url.searchParams.set('student',cfg.student);
+  url.searchParams.set('lesson','Present Perfect Simple');
+  url.searchParams.set('callback',cb);
+  url.searchParams.set('_',String(Date.now()));
+  tag.src=url.toString();document.body.appendChild(tag);
+ });
+}
+let readBusy=false;
+async function loadRemote(){
+ if(readBusy||!cloudReady()||!navigator.onLine)return;
+ readBusy=true;
+ const cfg={...cloudConfig()};
+ try{
+  const response=await cloudRead(cfg);
+  if(!cloudSameConfig(cfg))return;
+  if(!response.ok)throw Error(response.error||'Read failed');
+  if(!response.found){
+   if(isTeacherView())cloudStatus('У Google Sheets поки немає відповідей учениці.');
+   return;
+  }
+  if(!isTeacherView() && localEditsSinceLoad)return;
+  if(!isTeacherView() && (state.updatedAt||0)>(response.updatedAt||0))return;
+  const incoming=response.state;
+  if(!incoming||typeof incoming!=='object')throw Error('Invalid response');
+  const active=state.active;
+  for(const k of ['answers','open','ticks','checked','revealed']){
+   if(incoming[k]&&typeof incoming[k]==='object'&&!Array.isArray(incoming[k]))state[k]=incoming[k];
+  }
+  if(Array.isArray(incoming.done))state.done=incoming.done.filter(id=>STAGES.some(s=>s.id===id));
+  if(incoming.storyTopic)state.storyTopic=incoming.storyTopic;
+  if(incoming.cloudClientId)state.cloudClientId=incoming.cloudClientId;
+  state.updatedAt=response.updatedAt||state.updatedAt;
+  state.cloudConfig=cfg;
+  state.active=active;
+  for(const id of Object.keys(KEY))paintQuestion(id);
+  document.querySelectorAll('[data-open]').forEach(el=>{if(document.activeElement!==el)el.value=state.open[el.dataset.open]||'';});
+  document.querySelectorAll('[data-tick]').forEach(el=>el.checked=Boolean(state.ticks[el.dataset.tick]));
+  if(state.storyTopic)selectStoryTopic(state.storyTopic);
+  progress();
+  localSave();
+  cloudStatus((isTeacherView()?'Відповіді учениці оновлено':'Відповіді завантажено')+' з Google Sheets · '+new Date().toLocaleTimeString());
+ }catch(error){
+  cloudStatus('⚠ Не вдалося завантажити відповіді: '+error.message);
+ }finally{readBusy=false;}
+}
 function cloudAck(url,key,requestId){
   return new Promise((resolve,reject)=>{
     const cb='ppack_'+Math.random().toString(36).slice(2), tag=document.createElement('script');
@@ -363,7 +425,7 @@ function cloudAck(url,key,requestId){
   });
 }
 async function syncCloud(){
-  if(cloudBusy || !cloudReady()) return;
+  if(cloudBusy || !cloudReady() || isTeacherView()) return;
   if(!navigator.onLine){cloudPending=true;cloudStatus('⚠ Немає інтернету. Відповіді ще НЕ надіслані в Google Sheets.');return;}
   const cfg={...cloudConfig()}; cloudBusy=true;cloudPending=false;clearTimeout(cloudTimer);
   cloudStatus('Checking Google Sheets connection…');
@@ -425,14 +487,25 @@ function disconnectCloud(){state.cloudConfig={};cloudPending=false;cloudFailures
 document.getElementById('cloud-button').addEventListener('click',openCloud);
 document.getElementById('cloud-connect').addEventListener('click',connectCloud);
 document.getElementById('cloud-disconnect').addEventListener('click',disconnectCloud);
-document.getElementById('cloud-now').addEventListener('click',()=>{cloudFailures=0;clearTimeout(cloudTimer);if(cloudReady())syncCloud();else{localSave();toast('Google Sheets не підключено. Попросіть правильне посилання вчителя.');}});
+document.getElementById('cloud-now').addEventListener('click',()=>{cloudFailures=0;clearTimeout(cloudTimer);if(isTeacherView())loadRemote();else if(cloudReady())syncCloud();else{localSave();toast('Google Sheets не підключено. Попросіть правильне посилання вчителя.');}});
 window.addEventListener('online',()=>{if(cloudPending&&cloudReady())syncCloud();});
 cloudStatus(cloudReady()?'Перевірка підключення до Google Sheets…':'⚠ Google Sheets не підключено.');
 
 function selectStoryTopic(id){document.querySelectorAll('[data-story-topic]').forEach(b=>b.setAttribute('aria-checked',String(b.dataset.storyTopic===id)));document.querySelectorAll('.story-guide').forEach(g=>g.hidden=g.id!=='story-guide-'+id);}
 document.querySelectorAll('[data-story-topic]').forEach(b=>b.addEventListener('click',()=>{state.storyTopic=b.dataset.storyTopic;selectStoryTopic(state.storyTopic);save()}));if(state.storyTopic)selectStoryTopic(state.storyTopic);
 
-if(cloudReady()){scheduleCloud();}else{cloudStatus('⚠ Google Sheets не підключено. Відкрийте посилання, надіслане викладачем.');}
+if(isTeacherView()){
+ document.querySelectorAll('section.unit input,section.unit textarea,section.unit button[data-choice],section.unit button[data-check],section.unit button[data-retry],section.unit button[data-reveal],section.unit button[data-next]').forEach(el=>{el.disabled=true;});
+ document.getElementById('cloud-now').textContent='Refresh answers';
+ document.getElementById('cloud-now').onclick=e=>{e.stopImmediatePropagation();loadRemote();};
+}
+if(cloudReady()){
+ loadRemote();
+ if(isTeacherView()){
+  setInterval(()=>{if(!document.hidden)loadRemote();},5000);
+  window.addEventListener('focus',loadRemote);
+ }
+}else{cloudStatus('⚠ Google Sheets не підключено. Відкрийте посилання, надіслане викладачем.');}
 
 
 function importPrivateCopy(file){
